@@ -913,23 +913,34 @@ int64_t IndexOfOffset(size_t length,
   }
 }
 
-void IndexOfString(const FunctionCallbackInfo<Value>& args) {
+void SlowIndexOfString(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
   Isolate* isolate = env->isolate();
 
   CHECK(args[1]->IsString());
-  CHECK(args[2]->IsNumber());
+  CHECK(args[2]->IsNumber()); 
   CHECK(args[3]->IsInt32());
   CHECK(args[4]->IsBoolean());
-
-  enum encoding enc = static_cast<enum encoding>(args[3].As<Int32>()->Value());
 
   THROW_AND_RETURN_UNLESS_BUFFER(env, args[0]);
   ArrayBufferViewContents<char> buffer(args[0]);
 
   Local<String> needle = args[1].As<String>();
   int64_t offset_i64 = args[2].As<Integer>()->Value();
+  int32_t enc = args[3].As<Int32>()->Value();
   bool is_forward = args[4]->IsTrue();
+
+  args.GetReturnValue().Set(IndexOfString(
+      buffer.data(), buffer.length(), needle, offset_i64, enc, is_forward));
+}
+
+int32_t IndexOfString(const char* buffer_data,
+                      size_t buffer_length,
+                      String needle,
+                      int64_t offset_i64,
+                      int32_t encoding,
+                      bool is_forward) {
+  enum encoding enc = static_cast<enum encoding>(encoding);
 
   const char* haystack = buffer.data();
   // Round down to the nearest multiple of 2 in case of UCS2.
@@ -946,22 +957,21 @@ void IndexOfString(const FunctionCallbackInfo<Value>& args) {
 
   if (needle_length == 0) {
     // Match String#indexOf() and String#lastIndexOf() behavior.
-    args.GetReturnValue().Set(static_cast<double>(opt_offset));
-    return;
+    return static_cast<double>(opt_offset);
   }
 
   if (haystack_length == 0) {
-    return args.GetReturnValue().Set(-1);
+    return -1;
   }
 
   if (opt_offset <= -1) {
-    return args.GetReturnValue().Set(-1);
+    return -1;
   }
   size_t offset = static_cast<size_t>(opt_offset);
   CHECK_LT(offset, haystack_length);
   if ((is_forward && needle_length + offset > haystack_length) ||
       needle_length > haystack_length) {
-    return args.GetReturnValue().Set(-1);
+    return -1;
   }
 
   size_t result = haystack_length;
@@ -969,10 +979,10 @@ void IndexOfString(const FunctionCallbackInfo<Value>& args) {
   if (enc == UCS2) {
     String::Value needle_value(isolate, needle);
     if (*needle_value == nullptr)
-      return args.GetReturnValue().Set(-1);
+      return -1;
 
     if (haystack_length < 2 || needle_value.length() < 1) {
-      return args.GetReturnValue().Set(-1);
+      return -1;
     }
 
     if constexpr (IsBigEndian()) {
@@ -982,7 +992,7 @@ void IndexOfString(const FunctionCallbackInfo<Value>& args) {
           reinterpret_cast<const uint16_t*>(decoder.out());
 
       if (decoded_string == nullptr)
-        return args.GetReturnValue().Set(-1);
+        return -1;
 
       result = nbytes::SearchString(reinterpret_cast<const uint16_t*>(haystack),
                                     haystack_length / 2,
@@ -1003,7 +1013,7 @@ void IndexOfString(const FunctionCallbackInfo<Value>& args) {
   } else if (enc == UTF8) {
     String::Utf8Value needle_value(isolate, needle);
     if (*needle_value == nullptr)
-      return args.GetReturnValue().Set(-1);
+      return -1;
 
     result =
         nbytes::SearchString(reinterpret_cast<const uint8_t*>(haystack),
@@ -1015,7 +1025,7 @@ void IndexOfString(const FunctionCallbackInfo<Value>& args) {
   } else if (enc == LATIN1) {
     uint8_t* needle_data = node::UncheckedMalloc<uint8_t>(needle_length);
     if (needle_data == nullptr) {
-      return args.GetReturnValue().Set(-1);
+      return -1;
     }
     needle->WriteOneByte(
         isolate, needle_data, 0, needle_length, String::NO_NULL_TERMINATION);
@@ -1029,9 +1039,23 @@ void IndexOfString(const FunctionCallbackInfo<Value>& args) {
     free(needle_data);
   }
 
-  args.GetReturnValue().Set(
-      result == haystack_length ? -1 : static_cast<int>(result));
+  return result == haystack_length ? -1 : static_cast<int>(result);
 }
+
+int32_t FastIndexOfString(v8::Local<v8::Value>,
+                          const FastApiTypedArray<char>& buffer,
+                          uint32_t needle,
+                          int64_t offset_i64,
+                          int32_t enc,
+                          bool is_forward) {
+  uint8_t* buffer_data;
+  CHECK(buffer.getStorageIfAligned(&buffer_data));
+  return IndexOfString(
+      buffer.data(), buffer.length(), needle, offset_i64, enc, is_forward);
+}
+
+static v8::CFunction fast_index_of_string(
+    v8::CFunction::Make(FastIndexOfString));
 
 void IndexOfBuffer(const FunctionCallbackInfo<Value>& args) {
   CHECK(args[1]->IsObject());
@@ -1606,7 +1630,7 @@ void Initialize(Local<Object> target,
                             "indexOfNumber",
                             SlowIndexOfNumber,
                             &fast_index_of_number);
-  SetMethodNoSideEffect(context, target, "indexOfString", IndexOfString);
+  SetFastMethodNoSideEffect(context, target, "indexOfString", SlowIndexOfString, &fast_index_of_string);
 
   SetMethod(context, target, "detachArrayBuffer", DetachArrayBuffer);
   SetMethod(context, target, "copyArrayBuffer", CopyArrayBuffer);
@@ -1683,7 +1707,10 @@ void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
   registry->Register(SlowIndexOfNumber);
   registry->Register(FastIndexOfNumber);
   registry->Register(fast_index_of_number.GetTypeInfo());
-  registry->Register(IndexOfString);
+  registry->Register(SlowIndexOfString);
+  registry->Register(FastIndexOfString);
+  registry
+      ->Register(fast_index_of_string.GetTypeInfo())
 
   registry->Register(Swap16);
   registry->Register(Swap32);
